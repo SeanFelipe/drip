@@ -1,19 +1,63 @@
 #!/usr/bin/env bash
 
-function http_get { # Adapted from http://github.com/technomancy/leiningen
-    local url="$1" path="$2"
+declare -a jvm_args
+declare -a main_args
+declare -a runtime_args
 
-    if [[ -z $http_get ]]; then
-        if type -p curl >/dev/null 2>&1; then
-            http_get='curl -fL# -o'
-        else
-            http_get='wget -O'
-        fi
+function jar_main_class {
+    local jar=$1
+    local line=$(unzip -p $jar META-INF/MANIFEST.MF | grep ^Main-Class:)
+    local main_class=$(expr -- "$line" : 'Main-Class: \([^[:space:]]*\)')
+    echo $main_class
+}
+
+function parse_args {
+    unset drip_command java_command
+    if [[ $# -eq 0 ]]; then
+        # no arguments provided
+        echo 'Usage: drip [command | same args as java]'
+        echo
+        echo 'drip supports the following commands:'
+        echo '    version          print drip version and exit'
+        echo '    upgrade          upgrade drip to the latest version'
+        echo '    kill [-signal]   kill all idle drip JVMs (with signal)'
+        echo '    ps               print a list of all drip processes'
+        exit 0
+    elif ! expr -- "$1" : '.*[.-]' > /dev/null; then
+        drip_command=$1
+        return
+    elif [[ $# -eq 1 && $1 == -* ]]; then
+        java_command=$1
+        return
     fi
-    mkdir -p "$(dirname $path)"
-    echo "Downloading $url..." >&2
-    $http_get "$path.pending" "$url" || return 1
-    mv -- "$path.pending" "$path"
+
+    unset classpath main_class main_args runtime_args context
+    for arg in "$@"; do
+        if [[ -z $main_class ]]; then
+            if [[ -z $context ]]; then
+                if [[ $arg == "-cp" || $arg == "-classpath" ]]; then
+                    context='-cp'
+                elif [[ $arg == "-jar" ]]; then
+                    context='-jar'
+                elif [[ $arg == --* ]]; then
+                    runtime_args+=("${arg:1}")
+                elif [[ $arg != -* ]]; then
+                    main_class=$arg
+                else
+                    jvm_args+=("$arg")
+                fi
+            else
+                classpath=$arg
+                if [[ $context == '-jar' ]]; then
+                    main_class=$(jar_main_class $arg)
+                fi
+                unset context
+            fi
+        else
+            main_args+=("$arg")
+        fi
+    done
+    main_class=${main_class//\//.}
 }
 
 function bootstrap {
@@ -61,129 +105,47 @@ function bootstrap {
     fi
 }
 
-function compile {
-    local base=$1
-    local src_file
-    local bin_file="$drip_root/$base"
-
-    if [[ -z $drip_dir ]]; then
-        mkdir -p "$drip_src"
-        src_file=$drip_src/$base.c
-        [[ -e $src_file ]] || http_get "$DRIP_SRC_URL/$base.c" "$src_file"
-    else
-        src_file=$drip_dir/src/$base.c
-    fi
-    if [[ $src_file -nt $bin_file ]]; then
-        gcc $src_file -o $bin_file
-    fi
-    echo "$bin_file"
-}
-
-function mvn_get {
-    local artifact="$1" group="$2" version="$3" url="$4"
-    local jar="$MVN_REPO/$group/$artifact/$version/$artifact-$version.jar"
-    [[ -e $jar ]] || http_get "$url" "$jar"
-    printf '%s' "$jar"
-}
-
-declare -a jvm_args
-declare -a main_args
-declare -a runtime_args
-
-function jar_main_class {
-    local jar=$1
-    local line=$(unzip -p $jar META-INF/MANIFEST.MF | grep ^Main-Class:)
-    local main_class=$(expr -- "$line" : 'Main-Class: \([^[:space:]]*\)')
-    echo $main_class
-}
-
-function parse_args {
-    unset drip_command java_command
-    if [[ $# -eq 0 ]]; then
-        echo 'Usage: drip [command | same args as java]'
-        echo
-        echo 'drip supports the following commands:'
-        echo '    version          print drip version and exit'
-        echo '    upgrade          upgrade drip to the latest version'
-        echo '    kill [-signal]   kill all idle drip JVMs (with signal)'
-        echo '    ps               print a list of all drip processes'
-        exit 0
-    elif ! expr -- "$1" : '.*[.-]' > /dev/null; then
-        drip_command=$1
-        return
-    elif [[ $# -eq 1 && $1 == -* ]]; then
-        java_command=$1
-        return
-    fi
-
-    unset classpath main_class main_args runtime_args context
-    for arg in "$@"; do
-        if [[ -z $main_class ]]; then
-            if [[ -z $context ]]; then
-                if [[ $arg == "-cp" || $arg == "-classpath" ]]; then
-                    context='-cp'
-                elif [[ $arg == "-jar" ]]; then
-                    context='-jar'
-                elif [[ $arg == --* ]]; then
-                    runtime_args+=("${arg:1}")
-                elif [[ $arg != -* ]]; then
-                    main_class=$arg
-                else
-                    jvm_args+=("$arg")
-                fi
-            else
-                classpath=$arg
-                if [[ $context == '-jar' ]]; then
-                    main_class=$(jar_main_class $arg)
-                fi
-                unset context
-            fi
-        else
-            main_args+=("$arg")
-        fi
-    done
-    main_class=${main_class//\//.}
-}
-
 function make_sha_path {
     opts="$PWD ${jvm_args[*]} $classpath $main_class"
-    sha=$(echo -n "$opts" | git hash-object --stdin)
+    sha=$(echo -n "$opts" | git hash-object --stdin)890
     sha_path=$drip_root/$sha
+    echo "make_sha_path: $sha_path"
     mkdir -p "$sha_path"
     echo -n "$opts" > $sha_path/opts
+    echo "make_sha_path: $sha_path"
 }
 
 function default_init {
     local f='%s\n%s'
     case $main_class in
-        clojure.main)
-            DRIP_INIT_CLASS='clojure.main'
-            DRIP_INIT=$(printf $f '-e' 'nil');;
         org.jruby.Main)
             DRIP_INIT_CLASS='org.jruby.main.DripMain'
             DRIP_INIT=$(printf $f '1 + 1');;
-        scala.tools.nsc.MainGenericRunner)
-            DRIP_INIT_CLASS='scala.tools.nsc.MainGenericRunner'
-            DRIP_INIT=$(printf $f '-e' 'null');;
     esac
 }
 
 function launch_jvm {
     jvm_dir=$sha_path/$$-$n
 
+    echo "in launch_jvm with jvm_dir: $jvm_dir"
+
     if mkdir "$jvm_dir"; then
         mkfifo "$jvm_dir/control"
+        echo "mkfifo complete"
 
         if [[ -z $DRIP_INIT_CLASS ]]; then
+            echo "default_init"
             default_init
         fi
         export DRIP_INIT_CLASS=${DRIP_INIT_CLASS//\//.}
         export DRIP_INIT
 
+        echo "executing money shot"
         $drip_daemon $DRIP_JAVA_CMD "${jvm_args[@]}" -Djava.awt.headless=true \
                                     "-classpath" "$drip_jar:$classpath" \
                                     org.flatland.drip.Main "$main_class" "$jvm_dir" \
                                     > /dev/null 2> $drip_root/error.log
+        echo "complete."
     fi
 }
 
@@ -310,54 +272,17 @@ function run_main {
     wait_for_exit
 }
 
-function run_drip_command {
-    case $drip_command in
-        version)
-            if [[ $drip_install == checkout ]]; then
-                git_sha="$(cd "$drip_dir"; git rev-parse --short HEAD)"
-            fi
-            printf 'drip version "%s" %s %s\n' $DRIP_VERSION $drip_install $git_sha;;
-        kill)
-            kill_jvms "$2";;
-        ps)
-            jps -vlm | grep org.flatland.drip.Main;;
-        upgrade)
-            case $drip_install in
-                standalone)
-                    rm -rf "$drip_src" # need to refetch in case it has changed
-                    http_get  "$DRIP_BIN_URL" "$script" || exit $?
-                    chmod +x "$script";;
-                checkout)
-                    (cd "$drip_dir" && git pull);;
-                package)
-                    echo Please use your package manager to upgrade Drip.
-                    echo For example:
-                    echo '  brew update && brew upgrade drip'
-            esac
-            bootstrap
-            exit $?;;
-        *)
-            echo Unknown command: $drip_command
-            exit 1;;
-    esac
-}
+
 
 # Let's go.
 
-DRIP_VERSION=0.2.5
+DRIP_VERSION=0.2.5.spw4N0
 DRIP_POOL=${DRIP_POOL:-1}
 DRIP_HOME=${DRIP_HOME:-~/.drip}
-DRIP_BRANCH=${DRIP_BRANCH:-master}
-DRIP_REPO=${DRIP_REPO:-http://clojars.org/repo}
-DRIP_JAR_URL=${DRIP_JAR_URL:-$DRIP_REPO/org/flatland/drip/$DRIP_VERSION/drip-$DRIP_VERSION.jar}
-DRIP_BIN_URL=${DRIP_BIN_URL:-https://raw.github.com/flatland/drip/$DRIP_BRANCH/bin/drip}
-DRIP_SRC_URL=${DRIP_SRC_URL:-https://raw.github.com/flatland/drip/$DRIP_BRANCH/src}
 DRIP_JAVA_CMD=${DRIP_JAVA_CMD:-java}
 DRIP_JAVA_CMD=$(which $DRIP_JAVA_CMD)
-MVN_REPO=${MVN_REPO:-~/.m2/repository}
 
 bootstrap
-
 parse_args "$@"
 
 if [[ -z $drip_command ]]; then
@@ -366,6 +291,5 @@ if [[ -z $drip_command ]]; then
     run_main
 
     exit $status
-else
-    run_drip_command
 fi
+
